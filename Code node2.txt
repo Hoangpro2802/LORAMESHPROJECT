@@ -1,0 +1,192 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+#define LORA_SCK 18
+#define LORA_MISO 19
+#define LORA_MOSI 23
+#define LORA_CS_PIN 5
+#define LORA_RST_PIN 14
+#define LORA_DIO0_PIN 26
+#define NODE_ID 2
+#define MAX_NEIGHBORS 10
+#define MAX_MESSAGES 100
+#define DISCOVERY_INTERVAL 10000UL
+#define MAX_HOPS 3
+#define NEIGHBOR_TIMEOUT 60000
+
+unsigned long lastDiscovery = 0;
+unsigned long relayedMessages[MAX_MESSAGES];
+int messageHead = 0, messageTail = 0;
+
+struct Neighbor {
+  int nodeID;
+  int rssi;
+  float snr;
+  unsigned long lastSeen;
+};
+Neighbor neighbors[MAX_NEIGHBORS];
+int neighborCount = 0;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS_PIN);
+  LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+
+  if (!LoRa.begin(433E6)) {
+    delay(1000);
+    ESP.restart();
+  }
+  LoRa.setTxPower(20);
+}
+
+void updateNeighbor(int nodeID, int rssi, float snr) {
+  for (int i = 0; i < neighborCount; i++) {
+    if (neighbors[i].nodeID == nodeID) {
+      neighbors[i].rssi = rssi;
+      neighbors[i].snr = snr;
+      neighbors[i].lastSeen = millis();
+      return;
+    }
+  }
+  if (neighborCount < MAX_NEIGHBORS) {
+    neighbors[neighborCount++] = {nodeID, rssi, snr, millis()};
+  } else {
+    int oldestIdx = 0;
+    unsigned long oldestTime = neighbors[0].lastSeen;
+    for (int i = 1; i < neighborCount; i++) {
+      if (neighbors[i].lastSeen < oldestTime) {
+        oldestTime = neighbors[i].lastSeen;
+        oldestIdx = i;
+      }
+    }
+    neighbors[oldestIdx] = {nodeID, rssi, snr, millis()};
+  }
+}
+
+void cleanupNeighbors() {
+  unsigned long currentMillis = millis();
+  for (int i = 0; i < neighborCount; i++) {
+    if (currentMillis - neighbors[i].lastSeen > NEIGHBOR_TIMEOUT) {
+      neighbors[i] = neighbors[neighborCount - 1];
+      neighborCount--;
+      i--;
+    }
+  }
+}
+
+void printNeighbors() {
+  for (int i = 0; i < neighborCount; i++) {
+    Serial.println("Node " + String(neighbors[i].nodeID) + ": RSSI=" + String(neighbors[i].rssi) + ", SNR=" + String(neighbors[i].snr) + ", LastSeen=" + String(millis() - neighbors[i].lastSeen) + "ms ago");
+  }
+  if (neighborCount == 0) {
+    Serial.println("No neighbors.");
+  }
+}
+
+void sendDiscoveryPacket() {
+  String discoveryMsg = String(NODE_ID) + "|DISCOVERY|0";
+  if (LoRa.beginPacket()) {
+    LoRa.print(discoveryMsg);
+    LoRa.endPacket();
+  }
+}
+
+void sendAck(int sourceID, unsigned long msgID) {
+  String ackMsg = String(NODE_ID) + "|" + String(sourceID) + "|" + String(msgID) + "|ACK";
+  if (LoRa.beginPacket()) {
+    LoRa.print(ackMsg);
+    LoRa.endPacket();
+  }
+}
+
+bool isMessageRelayed(unsigned long msgID) {
+  int current = messageTail;
+  while (current != messageHead) {
+    if (relayedMessages[current] == msgID) return true;
+    current = (current + 1) % MAX_MESSAGES;
+  }
+  return false;
+}
+
+void markMessageRelayed(unsigned long msgID) {
+  relayedMessages[messageHead] = msgID;
+  messageHead = (messageHead + 1) % MAX_MESSAGES;
+  if (messageHead == messageTail) {
+    messageTail = (messageTail + 1) % MAX_MESSAGES;
+  }
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - lastDiscovery >= DISCOVERY_INTERVAL) {
+    cleanupNeighbors();
+    sendDiscoveryPacket();
+    printNeighbors();
+    lastDiscovery = currentMillis;
+  }
+  
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String receivedMessage = "";
+    while (LoRa.available()) {
+      receivedMessage += (char)LoRa.read();
+    }
+    
+    int index1 = receivedMessage.indexOf("|");
+    if (index1 == -1) {
+      return;
+    }
+    int sourceID = receivedMessage.substring(0, index1).toInt();
+    
+    if (receivedMessage.indexOf("|DISCOVERY") != -1) {
+      updateNeighbor(sourceID, LoRa.packetRssi(), LoRa.packetSnr());
+      printNeighbors();
+      return;
+    }
+    
+    int index2 = receivedMessage.indexOf("|", index1 + 1);
+    if (index2 == -1) {
+      return;
+    }
+    int destID = receivedMessage.substring(index1 + 1, index2).toInt();
+    
+    int index3 = receivedMessage.indexOf("|", index2 + 1);
+    if (index3 == -1) {
+      return;
+    }
+    unsigned long msgID = receivedMessage.substring(index2 + 1, index3).toInt();
+    
+    int index4 = receivedMessage.indexOf("|", index3 + 1);
+    if (index4 == -1) {
+      return;
+    }
+    
+    if (destID != NODE_ID) {
+      return;
+    }
+    
+    if (isMessageRelayed(msgID)) {
+      return;
+    }
+    
+    int hopCount = receivedMessage.substring(index3 + 1, index4).toInt();
+    if (hopCount >= MAX_HOPS) {
+      return;
+    }
+    
+    String payload = receivedMessage.substring(index4 + 1);
+    
+    sendAck(sourceID, msgID);
+    
+    String newMessage = String(NODE_ID) + "|3|" + String(msgID) + "|" + String(hopCount + 1) + "|" + payload;
+    if (LoRa.beginPacket()) {
+      LoRa.print(newMessage);
+      if (LoRa.endPacket()) {
+        markMessageRelayed(msgID);
+      }
+    }
+  }
+}

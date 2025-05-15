@@ -1,0 +1,447 @@
+#include <SPI.h>
+#include <LoRa.h>
+#include <esp_task_wdt.h>
+
+#define SOUND_SENSOR_PIN      39
+#define LORA_SCK              18
+#define LORA_MISO             19
+#define LORA_MOSI             23
+#define LORA_CS_PIN           5
+#define LORA_RST_PIN          14
+#define LORA_DIO0_PIN         26
+#define WATCHDOG_TIMEOUT_MS    150000
+#define SAMPLE_BUFFER_SIZE    1000
+#define resetCooldown         10*60*1000UL
+#define loraRetryInterval     60000
+#define samplingDuration      1000
+#define interval              7000
+#define resetInterval         1*60*60*1000UL
+#define DISCOVERY_INTERVAL    10000UL
+#define ACK_TIMEOUT           15000
+#define MAX_RETRIES           3
+#define MAX_NEIGHBORS         10
+#define MAX_SENT_PACKETS      10
+#define MAX_MESSAGES          100
+#define NEIGHBOR_TIMEOUT      60000
+#define MIN_PACKET_INTERVAL   4000
+#define PACKET_EXPIRY         30000
+
+#define NODE_ID               1
+#define DEST_NODE_ID          3
+
+unsigned long previousMillis = 0, lastReset = 0, samplingStart = 0, lastLoRaRetry = 0;
+unsigned long lastLoopCheck = 0, lastResetAttempt = 0, lastDiscovery = 0;
+unsigned long lastPacketSent = 0;
+unsigned long messageID = 0;
+String preferredRoute = "Both";
+
+int LoRaFailures = 0, resetCount = 0;
+bool isSampling = false;
+bool waitingForAck = false;
+
+uint16_t sampleBuffer[SAMPLE_BUFFER_SIZE];
+uint16_t sampleIndex = 0, sampleCount = 0;
+
+struct Neighbor {
+  int nodeID;
+  int rssi;
+  float snr;
+  unsigned long lastSeen;
+};
+Neighbor neighbors[MAX_NEIGHBORS];
+int neighborCount = 0;
+
+struct SentPacket {
+  unsigned long msgID;
+  unsigned long sentTime;
+  int retries;
+  String message;
+  int destID;
+};
+SentPacket sentPackets[MAX_SENT_PACKETS];
+int sentPacketCount = 0;
+
+unsigned long relayedMessages[MAX_MESSAGES];
+int messageHead = 0, messageTail = 0;
+
+void setupLoRa() {
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS_PIN);
+  LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+  
+  digitalWrite(LORA_RST_PIN, LOW);
+  delay(10);
+  digitalWrite(LORA_RST_PIN, HIGH);
+  delay(10);
+  
+  int attempts = 0;
+  while (!LoRa.begin(433E6) && attempts < 5) {
+    delay(1000);
+    attempts++;
+    esp_task_wdt_reset();
+  }
+  
+  if (attempts >= 5) {
+    ESP.restart();
+  }
+  
+  LoRa.setTxPower(20);
+  LoRaFailures = 0;
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+  
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WATCHDOG_TIMEOUT_MS,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+  
+  pinMode(SOUND_SENSOR_PIN, INPUT);
+  pinMode(LORA_RST_PIN, OUTPUT);
+  analogSetAttenuation(ADC_11db);
+  
+  setupLoRa();
+  
+  lastReset = millis();
+  lastLoRaRetry = millis();
+  lastLoopCheck = millis();
+  lastResetAttempt = millis();
+  lastDiscovery = millis();
+}
+
+void updateNeighbor(int nodeID, int rssi, float snr) {
+  for (int i = 0; i < neighborCount; i++) {
+    if (neighbors[i].nodeID == nodeID) {
+      neighbors[i].rssi = rssi;
+      neighbors[i].snr = snr;
+      neighbors[i].lastSeen = millis();
+      return;
+    }
+  }
+  if (neighborCount < MAX_NEIGHBORS) {
+    neighbors[neighborCount++] = {nodeID, rssi, snr, millis()};
+  } else {
+    int oldestIdx = 0;
+    unsigned long oldestTime = neighbors[0].lastSeen;
+    for (int i = 1; i < neighborCount; i++) {
+      if (neighbors[i].lastSeen < oldestTime) {
+        oldestTime = neighbors[i].lastSeen;
+        oldestIdx = i;
+      }
+    }
+    neighbors[oldestIdx] = {nodeID, rssi, snr, millis()};
+  }
+}
+
+void cleanupNeighbors() {
+  unsigned long currentMillis = millis();
+  for (int i = 0; i < neighborCount; i++) {
+    if (currentMillis - neighbors[i].lastSeen > NEIGHBOR_TIMEOUT) {
+      neighbors[i] = neighbors[neighborCount - 1];
+      neighborCount--;
+      i--;
+    }
+  }
+}
+
+void printNeighbors() {
+  for (int i = 0; i < neighborCount; i++) {
+    Serial.println("Node " + String(neighbors[i].nodeID) + ": RSSI=" + String(neighbors[i].rssi) + ", SNR=" + String(neighbors[i].snr) + ", LastSeen=" + String(millis() - neighbors[i].lastSeen) + "ms ago");
+  }
+  if (neighborCount == 0) {
+    Serial.println("No neighbors.");
+  }
+}
+
+int getNextHop(int destID) {
+  cleanupNeighbors();
+  printNeighbors();
+  if (destID == NODE_ID) return NODE_ID;
+
+  int node2Idx = -1, node3Idx = -1;
+  for (int i = 0; i < neighborCount; i++) {
+    if (neighbors[i].nodeID == 2) node2Idx = i;
+    if (neighbors[i].nodeID == 3) node3Idx = i;
+  }
+
+  if (node2Idx == -1 && node3Idx == -1) {
+    return 3;
+  }
+
+  float score2 = (node2Idx != -1) ? (neighbors[node2Idx].snr * 10 + neighbors[node2Idx].rssi) : -1000.0;
+  float score3 = (node3Idx != -1) ? (neighbors[node3Idx].snr * 10 + neighbors[node3Idx].rssi) : -1000.0;
+
+  int chosenNode = (score2 > score3) ? 2 : 3;
+  return chosenNode;
+}
+
+void sendDiscoveryPacket() {
+  unsigned long currentMillis = millis();
+  
+  delay(random(50, 200));
+  String discoveryMsg = String(NODE_ID) + "|DISCOVERY|0";
+  if (LoRa.beginPacket()) {
+    LoRa.print(discoveryMsg);
+    if (LoRa.endPacket()) {
+      lastPacketSent = currentMillis;
+      lastDiscovery = currentMillis;
+      LoRaFailures = 0;
+    } else {
+      LoRaFailures++;
+    }
+  } else {
+    LoRaFailures++;
+  }
+}
+
+void markMessageRelayed(unsigned long msgID) {
+  relayedMessages[messageHead] = msgID;
+  messageHead = (messageHead + 1) % MAX_MESSAGES;
+  if (messageHead == messageTail) {
+    messageTail = (messageTail + 1) % MAX_MESSAGES;
+  }
+}
+
+bool isMessageRelayed(unsigned long msgID) {
+  int current = messageTail;
+  while (current != messageHead) {
+    if (relayedMessages[current] == msgID) return true;
+    current = (current + 1) % MAX_MESSAGES;
+  }
+  return false;
+}
+
+void checkAck(String receivedMessage) {
+  if (receivedMessage.indexOf("|ACK") != -1) {
+    int index1 = receivedMessage.indexOf("|");
+    if (index1 == -1) {
+      return;
+    }
+    int index2 = receivedMessage.indexOf("|", index1 + 1ankind: code
+    if (index2 == -1) {
+      return;
+    }
+    int index3 = receivedMessage.indexOf("|", index2 + 1);
+    if (index3 == -1) {
+      return;
+    }
+    unsigned long msgID = receivedMessage.substring(index2 + 1, index3).toInt();
+    for (int i = 0; i < sentPacketCount; i++) {
+      if (sentPackets[i].msgID == msgID) {
+        sentPackets[i] = sentPackets[sentPacketCount - 1];
+        sentPacketCount--;
+        waitingForAck = false;
+        break;
+      }
+    }
+  }
+}
+
+void checkFeedback(String receivedMessage) {
+  if (receivedMessage.indexOf("|FEEDBACK") != -1) {
+    int index1 = receivedMessage.indexOf("|");
+    int index2 = receivedMessage.indexOf("|", index1 + 1);
+    int index3 = receivedMessage.indexOf("|", index2 + 1);
+    int index4 = receivedMessage.indexOf("|", index3 + 1);
+    String feedback = receivedMessage.substring(index4 + 1);
+    if (feedback.startsWith("Route:Direct")) {
+      preferredRoute = "Direct";
+    } else if (feedback.startsWith("Route:Via2")) {
+      preferredRoute = "Via2";
+    }
+  }
+}
+
+void sendDataPacket(int destID, float dB, unsigned long msgID) {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastPacketSent < MIN_PACKET_INTERVAL) {
+    return;
+  }
+
+  delay(random(50, 200));
+  char LoRaMessage[50] = {0};
+  snprintf(LoRaMessage, sizeof(LoRaMessage), "%d|%d|%lu|%d|Noise: %.2f", NODE_ID, destID, msgID, 0, dB);
+  
+  if (LoRa.beginPacket()) {
+    LoRa.print(LoRaMessage);
+    if (LoRa.endPacket()) {
+      lastPacketSent = currentMillis;
+      LoRaFailures = 0;
+      
+      if (sentPacketCount < MAX_SENT_PACKETS) {
+        sentPackets[sentPacketCount++] = {msgID, millis(), 0, String(LoRaMessage), destID};
+        waitingForAck = true;
+      }
+    } else {
+      LoRaFailures++;
+    }
+  } else {
+    LoRaFailures++;
+  }
+}
+
+void retryPackets() {
+  unsigned long currentMillis = millis();
+  if (waitingForAck) {
+    return;
+  }
+
+  for (int i = 0; i < sentPacketCount; i++) {
+    if (currentMillis - sentPackets[i].sentTime > ACK_TIMEOUT && sentPackets[i].retries < MAX_RETRIES) {
+      if (currentMillis - lastPacketSent < MIN_PACKET_INTERVAL) {
+        continue;
+      }
+      sentPackets[i].retries++;
+      sentPackets[i].sentTime = currentMillis;
+      if (LoRa.beginPacket()) {
+        LoRa.print(sentPackets[i].message);
+        if (LoRa.endPacket()) {
+          lastPacketSent = currentMillis;
+        }
+      }
+    } else if (currentMillis - sentPackets[i].sentTime > PACKET_EXPIRY) {
+      sentPackets[i] = sentPackets[sentPacketCount - 1];
+      sentPacketCount--;
+      i--;
+    }
+  }
+}
+
+int getPeakADC() {
+  if (sampleCount == 0) return 1375;
+  
+  int peakValue = 0;
+  for (int i = 0; i < sampleCount; i++) {
+    if (sampleBuffer[i] >= 100 && sampleBuffer[i] <= 4000) {
+      if (sampleBuffer[i] > peakValue) peakValue = sampleBuffer[i];
+    }
+  }
+  
+  sampleCount = 0;
+  sampleIndex = 0;
+  
+  if (peakValue < 800) peakValue = 800;
+  return peakValue ? peakValue : 1375;
+}
+
+void loop() {
+  esp_task_wdt_reset();
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - lastLoopCheck > 10000) {
+    ESP.restart();
+  }
+  
+  lastLoopCheck = currentMillis;
+  
+  if (currentMillis - lastReset >= resetInterval || currentMillis < lastReset) {
+    ESP.restart();
+  }
+  
+  if (currentMillis - lastDiscovery >= DISCOVERY_INTERVAL) {
+    cleanupNeighbors();
+    sendDiscoveryPacket();
+    printNeighbors();
+    preferredRoute = "Both";
+    lastDiscovery = currentMillis;
+  }
+  
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String receivedMessage = "";
+    while (LoRa.available()) {
+      receivedMessage += (char)LoRa.read();
+    }
+    
+    int index1 = receivedMessage.indexOf("|");
+    if (index1 == -1) {
+      return;
+    }
+    int sourceID = receivedMessage.substring(0, index1).toInt();
+    
+    if (receivedMessage.indexOf("|DISCOVERY") != -1) {
+      updateNeighbor(sourceID, LoRa.packetRssi(), LoRa.packetSnr());
+      printNeighbors();
+    } else if (receivedMessage.indexOf("|ACK") != -1) {
+      checkAck(receivedMessage);
+    } else if (receivedMessage.indexOf("|FEEDBACK") != -1) {
+      checkFeedback(receivedMessage);
+    }
+  }
+  
+  if (currentMillis - previousMillis >= interval - samplingDuration && !isSampling) {
+    isSampling = true;
+    samplingStart = currentMillis;
+    sampleCount = 0;
+    sampleIndex = 0;
+  }
+  
+  static unsigned long lastSample = 0;
+  if (isSampling && currentMillis - samplingStart < samplingDuration && currentMillis - lastSample >= 1) {
+    int value = analogRead(SOUND_SENSOR_PIN);
+    if (sampleIndex < SAMPLE_BUFFER_SIZE) {
+      sampleBuffer[sampleIndex++] = value;
+      sampleCount++;
+    }
+    lastSample = currentMillis;
+  }
+  
+  if (isSampling && currentMillis - samplingStart >= samplingDuration) {
+    isSampling = false;
+  }
+  
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    isSampling = false;
+    
+    int adcValue = getPeakADC();
+    
+    float dB = 40.0;
+    if (adcValue < 1250) dB = 40 + (adcValue - 800) * (50.0 - 40.0) / (1250 - 800);
+    else if (adcValue < 1750) dB = 50 + (adcValue - 1250) * (60.0 - 50.0) / (1750 - 1250);
+    else if (adcValue < 2250) dB = 60 + (adcValue - 1750) * (70.0 - 60.0) / (2250 - 1750);
+    else if (adcValue < 2750) dB = 70 + (adcValue - 2250) * (80.0 - 70.0) / (2750 - 2250);
+    else if (adcValue < 3100) dB = 80 + (adcValue - 2750) * (90.0 - 80.0) / (3100 - 2750);
+    else dB = 90;
+    
+    unsigned long currentMsgID = messageID++;
+    if (preferredRoute == "Both") {
+      int nextHop = getNextHop(DEST_NODE_ID);
+      bool hasNode2 = false, hasNode3 = false;
+      for (int i = 0; i < neighborCount; i++) {
+        if (neighbors[i].nodeID == 2) hasNode2 = true;
+        if (neighbors[i].nodeID == 3) hasNode3 = true;
+      }
+      if (hasNode2 && nextHop == 2) {
+        sendDataPacket(2, dB, currentMsgID);
+      }
+      if (hasNode3) {
+        sendDataPacket(3, dB, currentMsgID);
+      }
+      if (!hasNode2 && !hasNode3) {
+        sendDataPacket(3, dB, currentMsgID);
+      }
+    } else if (preferredRoute == "Direct") {
+      sendDataPacket(3, dB, currentMsgID);
+    } else if (preferredRoute == "Via2") {
+      sendDataPacket(2, dB, currentMsgID);
+    }
+    
+    retryPackets();
+    
+    if (LoRaFailures >= 5 && (currentMillis - lastLoRaRetry >= loraRetryInterval)) {
+      if (resetCount < 5 || (currentMillis - lastResetAttempt >= resetCooldown)) {
+        resetCount++;
+        lastResetAttempt = currentMillis;
+        ESP.restart();
+      } else {
+        LoRaFailures = 0;
+      }
+    }
+  }
+}

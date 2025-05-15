@@ -1,0 +1,467 @@
+#include <WiFi.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <SPI.h>
+#include <SD.h>
+#include <LoRa.h>
+#include <time.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <ModbusIP_ESP8266.h>
+
+const char* ssid = "Star 4_8135";
+const char* password = "1234abcd";
+#define ADAFRUIT_IO_SERVER "io.adafruit.com"
+#define ADAFRUIT_IO_USERNAME "IOTPTITD21"
+#define ADAFRUIT_IO_KEY "aio_pkUxd0C2RfnSdFGu88fsiWMI1hLEFa"
+
+#define R1 1
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 7 * 3600, 60000);
+
+#define SD_CS_PIN 4
+#define LORA_SCK 18
+#define LORA_MISO 19
+#define LORA_MOSI 23
+#define LORA_CS_PIN 5
+#define LORA_RST_PIN 14
+#define LORA_DIO0_PIN 26
+#define NODE_ID 3
+#define TIMEOUT_MS 3000
+#define DISCOVERY_INTERVAL 15000UL
+#define MAX_NEIGHBORS 10
+#define MAX_HOPS 3
+#define NEIGHBOR_TIMEOUT 40000
+#define MAX_MESSAGES 100
+#define MAX_PACKETS_PER_MSG 6
+#define HTTP_TIMEOUT 5000
+#define WIFI_RECONNECT_INTERVAL 15000
+#define ROUTING_CHECK_INTERVAL 10000
+
+WiFiClientSecure wifiSecureClient;
+HTTPClient http;
+bool sdOK = false;
+unsigned long lastDiscovery = 0;
+unsigned long lastWiFiCheck = 0;
+unsigned long lastRoutingCheck = 0;
+unsigned long processedMessages[MAX_MESSAGES];
+int messageHead = 0, messageTail = 0;
+String lastRoute = "Direct";
+
+ModbusIP mb;
+
+struct Neighbor {
+  int nodeID;
+  int rssi;
+  float snr;
+  unsigned long lastSeen;
+};
+Neighbor neighbors[MAX_NEIGHBORS];
+int neighborCount = 0;
+
+struct PacketInfo {
+  String packet;
+  int rssi;
+  float snr;
+  unsigned long msgID;
+  int sourceID;
+  int hopCount;
+  bool processed;
+  unsigned long timestamp;
+};
+PacketInfo packets[MAX_PACKETS_PER_MSG];
+int packetCount = 0;
+
+bool isValidData(float dB, int rssi, float snr) {
+  if (dB == 0 || dB == 5 || dB == 6) return false;
+  if (dB < 30 || dB > 120) return false;
+  if (rssi < -120 || snr < -9.0) return false;
+  return true;
+}
+
+void setupWiFi() {
+  WiFi.begin(ssid, password);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 15) {
+    delay(1000);
+    attempts++;
+  }
+}
+
+void reconnectWiFi() {
+  if (WiFi.status() != WL_CONNECTED && millis() - lastWiFiCheck >= WIFI_RECONNECT_INTERVAL) {
+    WiFi.disconnect();
+    setupWiFi();
+    lastWiFiCheck = millis();
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  setupWiFi();
+  timeClient.begin();
+
+  mb.server();
+  mb.addHreg(R1, 0);
+
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+  if (SD.begin(SD_CS_PIN)) {
+    sdOK = true;
+    if (!SD.exists("/noise_logs.txt")) {
+      digitalWrite(LORA_CS_PIN, HIGH);
+      File logFile = SD.open("/noise_logs.txt", FILE_WRITE);
+      if (logFile) {
+        logFile.println("Date, Time, Noise Level (dB)");
+        logFile.close();
+      }
+      digitalWrite(LORA_CS_PIN, LOW);
+    }
+  } else {
+    sdOK = false;
+  }
+
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS_PIN);
+  LoRa.setPins(LORA_CS_PIN, LORA_RST_PIN, LORA_DIO0_PIN);
+  digitalWrite(LORA_CS_PIN, HIGH);
+  if (!LoRa.begin(433E6)) {
+    while (1);
+  }
+  LoRa.setTxPower(20);
+  digitalWrite(LORA_CS_PIN, LOW);
+
+  wifiSecureClient.setInsecure();
+  wifiSecureClient.setTimeout(HTTP_TIMEOUT);
+  http.setTimeout(HTTP_TIMEOUT);
+}
+
+void updateNeighbor(int nodeID, int rssi, float snr) {
+  for (int i = 0; i < neighborCount; i++) {
+    if (neighbors[i].nodeID == nodeID) {
+      neighbors[i].rssi = rssi;
+      neighbors[i].snr = snr;
+      neighbors[i].lastSeen = millis();
+      return;
+    }
+  }
+  if (neighborCount < MAX_NEIGHBORS) {
+    neighbors[neighborCount++] = {nodeID, rssi, snr, millis()};
+  }
+}
+
+void cleanupNeighbors() {
+  unsigned long currentMillis = millis();
+  for (int i = 0; i < neighborCount; i++) {
+    if (currentMillis - neighbors[i].lastSeen > NEIGHBOR_TIMEOUT) {
+      neighbors[i] = neighbors[neighborCount - 1];
+      neighborCount--;
+      i--;
+    }
+  }
+}
+
+void printRoutingTable() {
+  for (int i = 0; i < neighborCount; i++) {
+    Serial.printf("%6d | %4d | %4.1f | %ld\n",
+                  neighbors[i].nodeID,
+                  neighbors[i].rssi,
+                  neighbors[i].snr,
+                  millis() - neighbors[i].lastSeen);
+  }
+  if (neighborCount == 0) {
+    Serial.println("No neighbors.");
+  }
+}
+
+void sendDiscoveryPacket() {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  digitalWrite(SD_CS_PIN, HIGH);
+  digitalWrite(LORA_CS_PIN, LOW);
+  String discoveryMsg = String(NODE_ID) + "|DISCOVERY|0";
+  LoRa.beginPacket();
+  LoRa.print(discoveryMsg);
+  LoRa.endPacket();
+  digitalWrite(LORA_CS_PIN, HIGH);
+}
+
+void sendAck(int sourceID, unsigned long msgID) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  digitalWrite(SD_CS_PIN, HIGH);
+  digitalWrite(LORA_CS_PIN, LOW);
+  String ackMsg = String(NODE_ID) + "|" + String(sourceID) + "|" + String(msgID) + "|ACK";
+  LoRa.beginPacket();
+  LoRa.print(ackMsg);
+  LoRa.endPacket();
+  digitalWrite(LORA_CS_PIN, HIGH);
+}
+
+void sendFeedback(unsigned long msgID, String route) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  digitalWrite(SD_CS_PIN, HIGH);
+  digitalWrite(LORA_CS_PIN, LOW);
+  String feedbackMsg = String(NODE_ID) + "|" + String(1) + "|" + String(msgID) + "|FEEDBACK|Route:" + route;
+  LoRa.beginPacket();
+  LoRa.print(feedbackMsg);
+  LoRa.endPacket();
+  digitalWrite(LORA_CS_PIN, HIGH);
+  lastRoute = route;
+}
+
+bool isMessageProcessed(unsigned long msgID) {
+  int current = messageTail;
+  while (current != messageHead) {
+    if (processedMessages[current] == msgID) return true;
+    current = (current + 1) % MAX_MESSAGES;
+  }
+  return false;
+}
+
+void markMessageProcessed(unsigned long msgID) {
+  processedMessages[messageHead] = msgID;
+  messageHead = (messageHead + 1) % MAX_MESSAGES;
+  if (messageHead == messageTail) {
+    messageTail = (messageTail + 1) % MAX_MESSAGES;
+  }
+}
+
+void sendToAdafruitIO(float dB) {
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+  digitalWrite(LORA_CS_PIN, HIGH);
+  digitalWrite(SD_CS_PIN, HIGH);
+  String url = "https://io.adafruit.com/api/v2/" + String(ADAFRUIT_IO_USERNAME) + "/feeds/noise-level/data";
+  http.begin(wifiSecureClient, url);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  http.addHeader("X-AIO-Key", ADAFRUIT_IO_KEY);
+  http.setTimeout(HTTP_TIMEOUT);
+ 
+  int httpCode = http.POST("value=" + String(dB));
+  http.end();
+}
+
+void writeToSD(String dateStr, String timeStr, float dB) {
+  if (!sdOK) return;
+  digitalWrite(LORA_CS_PIN, HIGH);
+  digitalWrite(SD_CS_PIN, LOW);
+  File logFile = SD.open("/noise_logs.txt", FILE_APPEND);
+  if (logFile) {
+    logFile.print(dateStr);
+    logFile.print(", ");
+    logFile.print(timeStr);
+    logFile.print(", ");
+    logFile.println(dB);
+    logFile.close();
+  }
+  digitalWrite(SD_CS_PIN, HIGH);
+}
+
+String getRecommendedRoute() {
+  int node1Idx = -1, node2Idx = -1;
+  for (int i = 0; i < neighborCount; i++) {
+    if (neighbors[i].nodeID == 1) node1Idx = i;
+    if (neighbors[i].nodeID == 2) node2Idx = i;
+  }
+
+  if (node1Idx == -1 && node2Idx == -1) {
+    return "Direct";
+  }
+  if (node1Idx == -1) {
+    return "Via2";
+  }
+  if (node2Idx == -1) {
+    return "Direct";
+  }
+
+  float score1 = neighbors[node1Idx].snr * 5 + neighbors[node1Idx].rssi + 5;
+  float score2 = neighbors[node2Idx].snr * 5 + neighbors[node2Idx].rssi;
+
+  String route = (neighbors[node2Idx].rssi > neighbors[node1Idx].rssi + 10) ? "Via2" : "Direct";
+  return route;
+}
+
+void checkRoutingTable() {
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastRoutingCheck < ROUTING_CHECK_INTERVAL) return;
+
+  cleanupNeighbors();
+  String currentRoute = getRecommendedRoute();
+ 
+  if (currentRoute != lastRoute) {
+    unsigned long dummyMsgID = millis();
+    sendFeedback(dummyMsgID, currentRoute);
+  }
+
+  lastRoutingCheck = currentMillis;
+}
+
+void processPackets() {
+  if (packetCount == 0) return;
+
+  for (int i = 0; i < packetCount; i++) {
+    if (packets[i].processed) continue;
+
+    unsigned long currentMsgID = packets[i].msgID;
+    int bestIdx = i;
+    for (int j = i + 1; j < packetCount; j++) {
+      if (packets[j].msgID == currentMsgID && !packets[j].processed) {
+        if (packets[j].snr > packets[bestIdx].snr ||
+            (packets[j].snr == packets[bestIdx].snr && packets[j].rssi > packets[bestIdx].rssi)) {
+          bestIdx = j;
+        }
+      }
+    }
+
+    String packet = packets[bestIdx].packet;
+    int index1 = packet.indexOf("|");
+    int index2 = packet.indexOf("|", index1 + 1);
+    int index3 = packet.indexOf("|", index2 + 1);
+    int index4 = packet.indexOf("|", index3 + 1);
+
+    int sourceID = packet.substring(0, index1).toInt();
+    int destID = packet.substring(index1 + 1, index2).toInt();
+    unsigned long msgID = packet.substring(index2 + 1, index3).toInt();
+    int hopCount = packet.substring(index3 + 1, index4).toInt();
+    String payload = packet.substring(index4 + 1);
+    float dB = payload.substring(7).toFloat();
+
+    if (isValidData(dB, packets[bestIdx].rssi, packets[bestIdx].snr)) {
+      timeClient.update();
+      time_t rawTime = timeClient.getEpochTime();
+      struct tm *timeInfo = localtime(&rawTime);
+      String dateStr = String(timeInfo->tm_year + 1900) + "/" +
+                       String(timeInfo->tm_mon + 1) + "/" +
+                       String(timeInfo->tm_mday);
+      String timeStr = String(timeInfo->tm_hour) + ":" +
+                       String(timeInfo->tm_min) + ":" +
+                       String(timeInfo->tm_sec);
+
+      sendAck(sourceID, msgID);
+      markMessageProcessed(msgID);
+     
+      String route = getRecommendedRoute();
+      sendFeedback(msgID, route);
+
+      int noiseLevel = (int)(dB * 100);
+      mb.Hreg(R1, noiseLevel);
+
+      writeToSD(dateStr, timeStr, dB);
+      sendToAdafruitIO(dB);
+    }
+
+    for (int j = 0; j < packetCount; j++) {
+      if (packets[j].msgID == currentMsgID) {
+        packets[j].processed = true;
+      }
+    }
+  }
+
+  int newCount = 0;
+  for (int i = 0; i < packetCount; i++) {
+    if (!packets[i].processed) {
+      packets[newCount++] = packets[i];
+    }
+  }
+  packetCount = newCount;
+}
+
+void loop() {
+  mb.task();
+  unsigned long currentMillis = millis();
+ 
+  reconnectWiFi();
+  checkRoutingTable();
+
+  static unsigned long lastIPLog = 0;
+  const unsigned long ipLogInterval = 30000;
+  if (WiFi.status() == WL_CONNECTED && currentMillis - lastIPLog >= ipLogInterval) {
+    lastIPLog = currentMillis;
+  }
+
+  if (currentMillis - lastDiscovery >= DISCOVERY_INTERVAL) {
+    cleanupNeighbors();
+    sendDiscoveryPacket();
+    printRoutingTable();
+    lastDiscovery = currentMillis;
+  }
+ 
+  digitalWrite(SD_CS_PIN, HIGH);
+  digitalWrite(LORA_CS_PIN, LOW);
+  int packetSize = LoRa.parsePacket();
+  if (packetSize) {
+    String receivedMessage = "";
+    while (LoRa.available()) {
+      receivedMessage += (char)LoRa.read();
+    }
+    digitalWrite(LORA_CS_PIN, HIGH);
+
+    int index1 = receivedMessage.indexOf("|");
+    if (index1 == -1) {
+      return;
+    }
+    int sourceID = receivedMessage.substring(0, index1).toInt();
+   
+    if (receivedMessage.indexOf("|DISCOVERY") != -1) {
+      updateNeighbor(sourceID, LoRa.packetRssi(), LoRa.packetSnr());
+      printRoutingTable();
+      return;
+    }
+   
+    if (receivedMessage.indexOf("|ACK") != -1) {
+      return;
+    }
+   
+    int index2 = receivedMessage.indexOf("|", index1 + 1);
+    if (index2 == -1) {
+      return;
+    }
+    int destID = receivedMessage.substring(index1 + 1, index2).toInt();
+   
+    int index3 = receivedMessage.indexOf("|", index2 + 1);
+    if (index3 == -1) {
+      return;
+    }
+    unsigned long msgID = receivedMessage.substring(index2 + 1, index3).toInt();
+   
+    int index4 = receivedMessage.indexOf("|", index3 + 1);
+    if (index4 == -1) {
+      return;
+    }
+   
+    int hopCount = receivedMessage.substring(index3 + 1, index4).toInt();
+   
+    if (destID != NODE_ID) {
+      return;
+    }
+   
+    if (hopCount > MAX_HOPS) {
+      return;
+    }
+   
+    if (isMessageProcessed(msgID)) {
+      return;
+    }
+   
+    int rssi = LoRa.packetRssi();
+    float snr = LoRa.packetSnr();
+   
+    if (packetCount < MAX_PACKETS_PER_MSG) {
+      packets[packetCount++] = {receivedMessage, rssi, snr, msgID, sourceID, hopCount, false, millis()};
+    }
+  } else {
+    digitalWrite(LORA_CS_PIN, HIGH);
+  }
+ 
+  if (packetCount > 0 && millis() - packets[0].timestamp >= TIMEOUT_MS) {
+    processPackets();
+  }
+}
